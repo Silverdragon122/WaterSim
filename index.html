@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Three.js Water Physics</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #mayhemButton {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            padding: 10px 20px;
+            background-color: red;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <button id="mayhemButton">Mayhem Bomb (May Cause massive performance decrease)</button>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.150.1/examples/jsm/",
+          "stats.js": "https://cdnjs.cloudflare.com/ajax/libs/stats.js/r17/Stats.min.js"
+        }
+      }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { Water } from 'three/addons/objects/Water.js';
+        import { Sky } from 'three/addons/objects/Sky.js';
+        import Stats from 'stats.js';
+
+        let scene, camera, renderer, water, raycaster, mouse, dynamicNormalMap, stats;
+        let explosions = [];
+        let cannonballs = [];
+        let ripples = [];
+        let isDragging = false;
+
+        class Ripple {
+            constructor(position) {
+                this.position = position;
+                this.time = 0;
+                this.duration = 2.0;
+                this.radius = 0;
+                this.maxRadius = 30;
+                this.strength = 1.0;
+            }
+
+            update(delta) {
+                this.time += delta;
+                this.radius = (this.time / this.duration) * this.maxRadius;
+                this.strength = Math.pow(1.0 - (this.time / this.duration), 2);
+                return this.time < this.duration;
+            }
+        }
+
+        class Explosion {
+            constructor(position) {
+                this.position = position;
+                this.time = 0;
+                this.duration = 1.5;
+                this.maxRadius = 15;
+                this.strength = 1.0;
+                this.createParticles();
+            }
+
+            createParticles() {
+                const particleCount = 50;
+                const positions = new Float32Array(particleCount * 3);
+                const particleGeometry = new THREE.BufferGeometry();
+                const particleMaterial = new THREE.PointsMaterial({
+                    color: 0xffffff,
+                    size: 0.5,
+                    transparent: true,
+                    opacity: 0.8
+                });
+
+                for(let i = 0; i < particleCount; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const radius = Math.random() * 5;
+                    positions[i * 3] = this.position.x + Math.cos(angle) * radius;
+                    positions[i * 3 + 1] = this.position.y;
+                    positions[i * 3 + 2] = this.position.z + Math.sin(angle) * radius;
+                }
+
+                particleGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                this.particles = new THREE.Points(particleGeometry, particleMaterial);
+                scene.add(this.particles);
+            }
+
+            update(delta) {
+                this.time += delta;
+                this.strength = Math.pow(1.0 - (this.time / this.duration), 2);
+                
+                if (this.time >= this.duration) {
+                    scene.remove(this.particles);
+                    return false;
+                }
+                
+                const positions = this.particles.geometry.attributes.position.array;
+                for(let i = 0; i < positions.length; i += 3) {
+                    positions[i + 1] += (10 * delta);
+                }
+                this.particles.geometry.attributes.position.needsUpdate = true;
+                this.particles.material.opacity = this.strength;
+                
+                return true;
+            }
+        }
+
+        class DroppedObject {
+            static types = [
+                {
+                    name: 'cannonball',
+                    geometry: new THREE.SphereGeometry(2, 32, 32),
+                    mass: 8,
+                    density: 7800, // Steel density
+                    color: 0x888888,
+                    metalness: 0.8,
+                    roughness: 0.3
+                },
+                {
+                    name: 'cube',
+                    geometry: new THREE.BoxGeometry(3, 3, 3),
+                    mass: 5,
+                    density: 2700, // Aluminum density
+                    color: 0xcccccc,
+                    metalness: 0.6,
+                    roughness: 0.4
+                },
+                {
+                    name: 'tetrahedron',
+                    geometry: new THREE.TetrahedronGeometry(2.5),
+                    mass: 3,
+                    density: 19300, // Gold density
+                    color: 0xffd700,
+                    metalness: 0.9,
+                    roughness: 0.1
+                }
+            ];
+
+            static createRandom(position, velocity) {
+                const type = this.types[Math.floor(Math.random() * this.types.length)];
+                const scale = 0.5 + Math.random() * 1.5;
+                
+                const material = new THREE.MeshStandardMaterial({
+                    color: type.color,
+                    metalness: type.metalness,
+                    roughness: type.roughness
+                });
+
+                const mesh = new THREE.Mesh(type.geometry, material);
+                mesh.scale.setScalar(scale);
+                mesh.position.copy(position);
+
+                return {
+                    mesh,
+                    velocity,
+                    gravity: new THREE.Vector3(0, -9.81, 0),
+                    mass: type.mass * Math.pow(scale, 3),
+                    radius: 2 * scale,
+                    inWater: false,
+                    hasCreatedSplash: false,
+                    density: type.density
+                };
+            }
+        }
+
+        function createDynamicNormalMap() {
+            const size = 1024;
+            const data = new Float32Array(size * size * 4);
+            const normalMap = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.FloatType);
+            normalMap.wrapS = normalMap.wrapT = THREE.RepeatWrapping;
+            return normalMap;
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 20000);
+            camera.position.set(30, 30, 100);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            document.body.appendChild(renderer.domElement);
+
+            dynamicNormalMap = createDynamicNormalMap();
+            const waterGeometry = new THREE.PlaneGeometry(10000, 10000, 100, 100);
+
+            water = new Water(waterGeometry, {
+                textureWidth: 1024,
+                textureHeight: 1024,
+                waterNormals: dynamicNormalMap,
+                sunDirection: new THREE.Vector3(),
+                sunColor: 0xffffff,
+                waterColor: 0x001e0f,
+                distortionScale: 8.7,
+                fog: scene.fog !== undefined
+            });
+
+            water.rotation.x = -Math.PI / 2;
+            scene.add(water);
+
+            const sky = new Sky();
+            sky.scale.setScalar(10000);
+            scene.add(sky);
+
+            const sun = new THREE.Vector3();
+            const skyUniforms = sky.material.uniforms;
+            skyUniforms['turbidity'].value = 10;
+            skyUniforms['rayleigh'].value = 2;
+            skyUniforms['mieCoefficient'].value = 0.005;
+            skyUniforms['mieDirectionalG'].value = 0.8;
+
+            const phi = THREE.MathUtils.degToRad(90 - 2);
+            const theta = THREE.MathUtils.degToRad(180);
+            sun.setFromSphericalCoords(1, phi, theta);
+
+            sky.material.uniforms['sunPosition'].value.copy(sun);
+            water.material.uniforms['sunDirection'].value.copy(sun).normalize();
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+            directionalLight.position.set(100, 100, 100);
+            scene.add(directionalLight);
+
+            raycaster = new THREE.Raycaster();
+            mouse = new THREE.Vector2();
+
+            window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+
+            window.addEventListener('resize', onWindowResize);
+
+            document.getElementById('mayhemButton').addEventListener('click', createMayhem);
+
+            // Initialize stats
+            stats = new Stats();
+            stats.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
+            document.body.appendChild(stats.dom);
+        }
+
+        function updateNormalMap(delta) {
+            const data = dynamicNormalMap.image.data;
+            const size = dynamicNormalMap.image.width;
+            
+            // Reset normals
+            for (let i = 0; i < data.length; i += 4) {
+                data[i] = 0.5;     // R
+                data[i + 1] = 0.5; // G
+                data[i + 2] = 1.0; // B
+                data[i + 3] = 1.0; // A
+            }
+            
+            // Update based on ripples
+            ripples.forEach(ripple => {
+                const center = new THREE.Vector2(
+                    (ripple.position.x / 10000 + 0.5) * size,
+                    (ripple.position.z / 10000 + 0.5) * size
+                );
+                
+                const strength = ripple.strength * 2.0;
+                const radius = (ripple.radius / 10000) * size;
+                
+                for (let y = 0; y < size; y++) {
+                    for (let x = 0; x < size; x++) {
+                        const dx = x - center.x;
+                        const dy = y - center.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        
+                        if (dist < radius) {
+                            const index = (y * size + x) * 4;
+                            const factor = (1 - dist / radius) * strength;
+                            
+                            const angle = Math.atan2(dy, dx);
+                            const wave = Math.sin(dist * 0.4 - ripple.radius * 0.5);
+                            
+                            data[index] += Math.cos(angle) * wave * factor;
+                            data[index + 1] += Math.sin(angle) * wave * factor;
+                        }
+                    }
+                }
+            });
+            
+            dynamicNormalMap.needsUpdate = true;
+        }
+
+        function onPointerDown(event) {
+            if (event.button === 2) { // Right-click
+                isDragging = true;
+            } else {
+                isDragging = false;
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            }
+        }
+
+        function onPointerMove(event) {
+            if (event.buttons === 2) { // Right-click
+                isDragging = true;
+            }
+        }
+
+        function onPointerUp(event) {
+            if (event.button === 2) { // Right-click
+                isDragging = false;
+            } else if (!isDragging) {
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObject(water);
+
+                if (intersects.length > 0) {
+                    const startPos = new THREE.Vector3(
+                        intersects[0].point.x,
+                        50,
+                        intersects[0].point.z
+                    );
+                    
+                    const velocity = new THREE.Vector3(
+                        (Math.random() - 0.5) * 5,
+                        -20 - Math.random() * 10,
+                        (Math.random() - 0.5) * 5
+                    );
+                    
+                    const obj = DroppedObject.createRandom(startPos, velocity);
+                    scene.add(obj.mesh);
+                    cannonballs.push(obj);
+                }
+            }
+        }
+
+        function createMayhem() {
+            for (let i = 0; i < 30; i++) {
+                const startPos = new THREE.Vector3(
+                    (Math.random() - 0.5) * 5,
+                    50,
+                    (Math.random() - 0.5) * 5
+                );
+                
+                const velocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 5,
+                    -20 - Math.random() * 10,
+                    (Math.random() - 0.5) * 5
+                );
+                
+                const obj = DroppedObject.createRandom(startPos, velocity);
+                scene.add(obj.mesh);
+                cannonballs.push(obj);
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            stats.begin();
+            render();
+            stats.end();
+        }
+
+        function render() {
+            const delta = 1/60;
+            
+            cannonballs = cannonballs.filter(obj => {
+                const waterLevel = 0;
+                const depth = obj.mesh.position.y - waterLevel;
+                obj.inWater = depth < 0;
+
+                if (obj.inWater) {
+                    const submergedVolume = Math.min(1, Math.abs(depth) / (obj.radius * 2));
+                    const buoyancyForce = new THREE.Vector3(0, 9.81 * submergedVolume, 0);
+                    
+                    const dragCoefficient = 0.47;
+                    const waterDensity = 1000;
+                    const area = Math.PI * obj.radius * obj.radius;
+                    const velocitySquared = obj.velocity.lengthSq();
+                    const dragMagnitude = 0.5 * dragCoefficient * waterDensity * area * velocitySquared;
+                    
+                    const dragForce = obj.velocity.clone().normalize().multiplyScalar(-dragMagnitude);
+                    
+                    const netForce = new THREE.Vector3();
+                    netForce.add(obj.gravity.clone().multiplyScalar(obj.mass));
+                    netForce.add(buoyancyForce.multiplyScalar(obj.mass));
+                    netForce.add(dragForce);
+                    
+                    obj.velocity.add(netForce.multiplyScalar(delta / obj.mass));
+                    
+                    if (!obj.hasCreatedSplash) {
+                        explosions.push(new Explosion(obj.mesh.position.clone()));
+                        ripples.push(new Ripple(obj.mesh.position.clone()));
+                        obj.hasCreatedSplash = true;
+                    }
+                } else {
+                    obj.velocity.add(obj.gravity.clone().multiplyScalar(delta));
+                    obj.hasCreatedSplash = false;
+                }
+
+                obj.mesh.position.add(obj.velocity.clone().multiplyScalar(delta));
+
+                if (obj.mesh.position.y < -50) {
+                    scene.remove(obj.mesh);
+                    return false;
+                }
+
+                return true;
+            });
+            
+            explosions = explosions.filter(explosion => explosion.update(delta));
+            ripples = ripples.filter(ripple => ripple.update(delta));
+            
+            updateNormalMap(delta);
+            water.material.uniforms['time'].value += delta;
+            
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+        animate();
+    </script>
+</body>
+</html>
